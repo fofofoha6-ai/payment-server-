@@ -145,8 +145,8 @@ if ($_SERVER['REQUEST_URI'] === '/api/pay') {
 <body>
 
 <div class="card">
-    <h1>💳 بوابة الدفع</h1>
-    <p class="subtitle">ادفع بأمان عبر Stripe</p>
+    <h1>💳  بوابة الدفع الحديثة</h1>
+    <p class="subtitle">بوابةع بأمان عبر Stripe</p>
 
     <div class="status">
         ✅ الخادم يعمل بنجاح
