@@ -1,5 +1,5 @@
-Flask==2.3.2
-Flask-CORS==4.0.0
+fastapi==0.104.1
+uvicorn[standard]==0.24.0
+square==31.0.0
 python-dotenv==1.0.0
-squareup==22.0.0
-requests==2.31.0
+pydantic==2.5.0
