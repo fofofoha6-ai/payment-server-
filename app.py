@@ -1,142 +1,223 @@
-import os
-import hashlib
-import time
-import logging
-from flask import Flask, request, jsonify
-from flask_cors import CORS
+from fastapi import FastAPI, HTTPException
+from fastapi.middleware.cors import CORSMiddleware
+from pydantic import BaseModel
+import square
 from square.client import Client
+from square.http.auth.o_auth_2 import BearerAuth
+import os
+import uuid
+import logging
+from typing import Optional, Dict, Any
 
-# إعدادات بسيطة
+# ============================================
+# إعدادات التسجيل (Logging)
+# ============================================
 logging.basicConfig(level=logging.INFO)
 logger = logging.getLogger(__name__)
 
-app = Flask(__name__)
-CORS(app)
-
-# جلب المتغيرات من البيئة (Render)
-SQUARE_ACCESS_TOKEN = os.environ.get('SQUARE_ACCESS_TOKEN')
-SQUARE_ENVIRONMENT = os.environ.get('SQUARE_ENVIRONMENT', 'sandbox')
-SQUARE_LOCATION_ID = os.environ.get('SQUARE_LOCATION_ID')
+# ============================================
+# قراءة المتغيرات البيئية
+# ============================================
+SQUARE_APPLICATION_ID = os.getenv("SQUARE_APPLICATION_ID", "")
+SQUARE_ACCESS_TOKEN = os.getenv("SQUARE_ACCESS_TOKEN", "")
+SQUARE_LOCATION_ID = os.getenv("SQUARE_LOCATION_ID", "")
+SQUARE_ENVIRONMENT = os.getenv("SQUARE_ENVIRONMENT", "SANDBOX")  # SANDBOX أو PRODUCTION
 
 # التحقق من وجود المفاتيح
-if not SQUARE_ACCESS_TOKEN:
-    logger.error("SQUARE_ACCESS_TOKEN not set!")
-if not SQUARE_LOCATION_ID:
-    logger.error("SQUARE_LOCATION_ID not set!")
+if not all([SQUARE_APPLICATION_ID, SQUARE_ACCESS_TOKEN, SQUARE_LOCATION_ID]):
+    logger.warning("⚠️ بعض المفاتيح البيئية غير موجودة! تأكد من تعيينها في Render")
 
-# تهيئة Square
-client = Client(
-    access_token=SQUARE_ACCESS_TOKEN,
-    environment='production' if SQUARE_ENVIRONMENT == 'production' else 'sandbox'
+# تحديد البيئة (Sandbox أو Production)
+environment = square.Environment.SANDBOX if SQUARE_ENVIRONMENT == "SANDBOX" else square.Environment.PRODUCTION
+
+# ============================================
+# تهيئة تطبيق FastAPI
+# ============================================
+app = FastAPI(
+    title="Square Payment API",
+    description="API لمعالجة المدفوعات عبر Square من تطبيق Flutter",
+    version="1.0.0"
 )
-payments_api = client.payments
 
-def generate_idempotency_key(identifier):
-    return hashlib.md5(f"{identifier}_{time.time()}".encode()).hexdigest()
+# ============================================
+# إعدادات CORS (السماح لـ Flutter بالاتصال)
+# ============================================
+app.add_middleware(
+    CORSMiddleware,
+    allow_origins=[
+        "*",  # في الإنتاج، استبدل بعنوان تطبيقك الفعلي
+        # "https://your-flutter-app.com",
+        # "http://localhost:3000",
+    ],
+    allow_credentials=True,
+    allow_methods=["*"],
+    allow_headers=["*"],
+)
 
-# ========== نقاط النهاية ==========
+# ============================================
+# تهيئة عميل Square
+# ============================================
+try:
+    client = Client(
+        bearer_auth_settings=BearerAuth(SQUARE_ACCESS_TOKEN),
+        environment=environment,
+    )
+    logger.info(f"✅ تم تهيئة Square Client بنجاح في بيئة: {SQUARE_ENVIRONMENT}")
+except Exception as e:
+    logger.error(f"❌ فشل تهيئة Square Client: {e}")
+    client = None
 
-@app.route('/api/payment/process', methods=['POST'])
-def process_payment():
+# ============================================
+# نماذج البيانات (Pydantic Models)
+# ============================================
+class PaymentRequest(BaseModel):
+    nonce: str
+    amount: str
+    currency: str = "USD"
+    reference_id: Optional[str] = None
+    note: Optional[str] = None
+
+class PaymentResponse(BaseModel):
+    status: str
+    payment_id: Optional[str] = None
+    order_id: Optional[str] = None
+    amount: Optional[int] = None
+    currency: Optional[str] = None
+    payment_status: Optional[str] = None
+    created_at: Optional[str] = None
+    message: Optional[str] = None
+    code: Optional[str] = None
+
+# ============================================
+# نقاط النهاية (Endpoints)
+# ============================================
+
+@app.get("/")
+async def root():
+    """نقطة البداية للتحقق من عمل الخادم"""
+    return {
+        "status": "online",
+        "service": "Square Payment API",
+        "environment": SQUARE_ENVIRONMENT,
+        "location_id": SQUARE_LOCATION_ID[:10] + "..." if SQUARE_LOCATION_ID else "Not set"
+    }
+
+@app.get("/health")
+async def health_check():
+    """نقطة للتحقق من صحة الخادم (يستخدمها Render)"""
+    return {
+        "status": "healthy",
+        "square_configured": client is not None,
+        "environment": SQUARE_ENVIRONMENT
+    }
+
+@app.post("/api/create-payment", response_model=PaymentResponse)
+async def create_payment(request: PaymentRequest):
+    """
+    معالجة طلب الدفع من Flutter
+    """
+    # التحقق من تهيئة العميل
+    if client is None:
+        raise HTTPException(
+            status_code=500,
+            detail="Square client not initialized. Check your API keys."
+        )
+
+    # التحقق من صحة المبلغ
     try:
-        data = request.get_json()
-        
-        if not data or not data.get('nonce') or not data.get('amount'):
-            return jsonify({'success': False, 'error': 'Missing nonce or amount'}), 400
-        
-        request_body = {
-            "idempotency_key": generate_idempotency_key('payment'),
-            "source_id": data.get('nonce'),
-            "amount_money": {
-                "amount": data.get('amount'),
-                "currency": data.get('currency', 'USD')
-            },
-            "location_id": SQUARE_LOCATION_ID,
-            "autocomplete": True
-        }
-        
-        if data.get('order_id'):
-            request_body["order_id"] = str(data.get('order_id'))
-        
-        result = payments_api.create_payment(request_body)
-        
+        amount_cents = int(float(request.amount) * 100)
+        if amount_cents <= 0:
+            raise ValueError("المبلغ يجب أن يكون أكبر من 0")
+    except ValueError as e:
+        raise HTTPException(
+            status_code=400,
+            detail={"status": "error", "message": f"مبلغ غير صالح: {str(e)}"}
+        )
+
+    # توليد معرف فريد لمنع تكرار الدفع
+    idempotency_key = str(uuid.uuid4())
+    
+    # بناء بيانات الدفع
+    payment_data = {
+        "source_id": request.nonce,
+        "idempotency_key": idempotency_key,
+        "amount_money": {
+            "amount": amount_cents,
+            "currency": request.currency
+        },
+        "location_id": SQUARE_LOCATION_ID,
+        "autocomplete": True,
+    }
+    
+    # إضافة بيانات اختيارية
+    if request.reference_id:
+        payment_data["reference_id"] = request.reference_id
+    if request.note:
+        payment_data["note"] = request.note
+    else:
+        payment_data["note"] = f"دفع من تطبيق Flutter - {idempotency_key[:8]}"
+
+    logger.info(f"🔑 بدء عملية دفع: {idempotency_key[:8]} - المبلغ: {request.amount} {request.currency}")
+
+    try:
+        # إرسال طلب الدفع إلى Square
+        payments_api = client.payments
+        result = payments_api.create_payment(payment_data)
+
         if result.is_success():
-            payment = result.body.get('payment', {})
-            return jsonify({
-                'success': True,
-                'payment_id': payment.get('id'),
-                'status': payment.get('status'),
-                'amount': payment.get('amount_money', {}).get('amount'),
-                'receipt_url': payment.get('receipt_url')
-            }), 200
-        else:
-            error = result.errors[0] if result.errors else None
-            return jsonify({
-                'success': False,
-                'error': error.get('detail') if error else 'Payment failed'
-            }), 400
+            payment = result.body["payment"]
+            logger.info(f"✅ تم الدفع بنجاح: {payment['id']}")
             
+            return PaymentResponse(
+                status="success",
+                payment_id=payment["id"],
+                order_id=payment.get("order_id"),
+                amount=payment["amount_money"]["amount"],
+                currency=payment["amount_money"]["currency"],
+                payment_status=payment["status"],
+                created_at=payment.get("created_at"),
+                message="تمت عملية الدفع بنجاح"
+            )
+        else:
+            # فشل الدفع - معالجة الأخطاء
+            error = result.errors[0] if result.errors else None
+            error_detail = error.detail if error else "Unknown error"
+            error_code = error.code if error else "UNKNOWN"
+            
+            logger.error(f"❌ فشل الدفع: {error_detail} (الكود: {error_code})")
+            
+            raise HTTPException(
+                status_code=400,
+                detail={
+                    "status": "error",
+                    "message": f"فشل الدفع: {error_detail}",
+                    "code": error_code
+                }
+            )
+            
+    except HTTPException:
+        # إعادة رفع استثناءات HTTPException كما هي
+        raise
     except Exception as e:
-        logger.error(f"Error: {str(e)}")
-        return jsonify({'success': False, 'error': str(e)}), 500
+        logger.error(f"❌ خطأ غير متوقع: {str(e)}")
+        raise HTTPException(
+            status_code=500,
+            detail={
+                "status": "error",
+                "message": f"حدث خطأ داخلي في الخادم: {str(e)}"
+            }
+        )
 
-@app.route('/api/payment/status/<payment_id>', methods=['GET'])
-def get_payment_status(payment_id):
-    try:
-        result = payments_api.get_payment(payment_id)
-        if result.is_success():
-            payment = result.body.get('payment', {})
-            return jsonify({
-                'success': True,
-                'status': payment.get('status'),
-                'payment': payment
-            }), 200
-        return jsonify({'success': False, 'error': 'Payment not found'}), 404
-    except Exception as e:
-        return jsonify({'success': False, 'error': str(e)}), 500
-
-@app.route('/api/payment/refund', methods=['POST'])
-def refund_payment():
-    try:
-        data = request.get_json()
-        payment_id = data.get('payment_id')
-        amount = data.get('amount')
-        
-        if not payment_id:
-            return jsonify({'success': False, 'error': 'Missing payment_id'}), 400
-        
-        if not amount:
-            payment_info = payments_api.get_payment(payment_id)
-            if payment_info.is_success():
-                amount = payment_info.body.get('payment', {}).get('amount_money', {}).get('amount')
-            else:
-                return jsonify({'success': False, 'error': 'Could not get payment'}), 400
-        
-        request_body = {
-            "idempotency_key": generate_idempotency_key(f"{payment_id}_refund"),
-            "payment_id": payment_id,
-            "amount_money": {
-                "amount": amount,
-                "currency": "USD"
-            },
-            "reason": data.get('reason', 'Refund')
-        }
-        
-        result = payments_api.refund_payment(request_body)
-        
-        if result.is_success():
-            return jsonify({
-                'success': True,
-                'refund': result.body.get('refund', {})
-            }), 200
-        return jsonify({'success': False, 'error': 'Refund failed'}), 400
-    except Exception as e:
-        return jsonify({'success': False, 'error': str(e)}), 500
-
-@app.route('/api/health', methods=['GET'])
-def health_check():
-    return jsonify({'status': 'healthy'}), 200
-
-if __name__ == '__main__':
-    port = int(os.environ.get('PORT', 5000))
-    app.run(host='0.0.0.0', port=port, debug=True)
+# ============================================
+# تشغيل السيرفر (للتطوير المحلي)
+# ============================================
+if __name__ == "__main__":
+    import uvicorn
+    port = int(os.getenv("PORT", 8000))
+    uvicorn.run(
+        "main:app",
+        host="0.0.0.0",
+        port=port,
+        reload=True,  # إيقاف التشغيل التلقائي في الإنتاج
+        log_level="info"
+    )
