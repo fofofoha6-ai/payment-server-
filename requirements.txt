@@ -3,3 +3,4 @@ uvicorn
 squareup_legacy
 python-dotenv
 pydantic
+gunicorn
